@@ -1,0 +1,14 @@
+{
+  "name": "equal-earth-projection",
+  "version": "1.0.0",
+  "description": "Equal Earth Projection によるインタラクティブな世界地図（ドラッグで中心経度を変更）",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "vitest run"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "vitest": "^2.1.4"
+  }
+}

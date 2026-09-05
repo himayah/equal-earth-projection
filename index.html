@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Equal Earth Projection Map</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #0b1a2b;
+    overflow: hidden;
+  }
+  #map {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+    touch-action: none;
+  }
+  #map.dragging {
+    cursor: grabbing;
+  }
+  #hud {
+    position: fixed;
+    left: 12px;
+    bottom: 10px;
+    color: #cfe3f7;
+    font: 12px/1.4 system-ui, sans-serif;
+    background: rgba(0, 0, 0, 0.35);
+    padding: 6px 10px;
+    border-radius: 6px;
+    pointer-events: none;
+    user-select: none;
+  }
+  #fallback {
+    display: none;
+    color: #fff;
+    font: 16px/1.6 system-ui, sans-serif;
+    padding: 24px;
+  }
+</style>
+</head>
+<body>
+<canvas id="map" role="img" aria-label="Equal Earth Projection による世界地図。ドラッグで中心経度を変更できます。"></canvas>
+<div id="hud">中心経度: <span id="lonReadout">0.0</span>° （ドラッグで回転）</div>
+<div id="fallback">お使いのブラウザは Canvas に対応していません。</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Projection module（純粋関数のみ。src/equalEarth.js と同一実装を維持する）
+  // ---------------------------------------------------------------------
+  const A1 = 1.340264;
+  const A2 = -0.081106;
+  const A3 = 0.000893;
+  const A4 = 0.003796;
+  const M = Math.sqrt(3) / 2;
+
+  function toRadians(deg) {
+    return (deg * Math.PI) / 180;
+  }
+
+  function toDegrees(rad) {
+    return (rad * 180) / Math.PI;
+  }
+
+  // 経度を (-180, 180] の範囲に正規化する。
+  function normalizeLongitude(lonDeg) {
+    let lon = lonDeg % 360;
+    if (lon <= -180) lon += 360;
+    if (lon > 180) lon -= 360;
+    return lon;
+  }
+
+  // Equal Earth Projection の投影式本体。
+  // lambda, phi はラジアン（lambda は中心経度からの差分）。
+  function equalEarthRaw(lambda, phi) {
+    const theta = Math.asin(M * Math.sin(phi));
+    const theta2 = theta * theta;
+    const theta6 = theta2 * theta2 * theta2;
+    const x =
+      (lambda * Math.cos(theta)) /
+      (M * (A1 + 3 * A2 * theta2 + theta6 * (7 * A3 + 9 * A4 * theta2)));
+    const y = theta * (A1 + A2 * theta2 + theta6 * (A3 + A4 * theta2));
+    return [x, y];
+  }
+
+  // 経度・緯度（度）と中心経度からキャンバス上のピクセル座標を求める。
+  function project(lonDeg, latDeg, centerLonDeg, scale, cx, cy) {
+    const deltaLonDeg = normalizeLongitude(lonDeg - centerLonDeg);
+    const [xProj, yProj] = equalEarthRaw(toRadians(deltaLonDeg), toRadians(latDeg));
+    return {
+      x: cx + scale * xProj,
+      y: cy - scale * yProj,
+    };
+  }
+
+  // 赤道上のスケールを基準に、ドラッグのピクセル移動量を経度変化量（度）に変換する。
+  function dragDeltaToLongitudeDelta(deltaPixels, scale) {
+    const pxPerRadianAtEquator = scale / (M * A1);
+    const deltaLonRad = -deltaPixels / pxPerRadianAtEquator;
+    return toDegrees(deltaLonRad);
+  }
+
+  // 投影空間での最大x値（経度差180°、緯度0°のとき）。スケール計算に使用する。
+  const PROJECTED_X_MAX = Math.PI / (M * A1);
+  // 投影空間での最大y値（極点）。スケール計算に使用する。
+  const PROJECTED_Y_MAX = equalEarthRaw(0, Math.PI / 2)[1];
+
+  // ---------------------------------------------------------------------
+  // Data module: 簡易化した世界の陸地ポリゴン（[経度, 緯度] の配列の配列）
+  // 元データ自体は経度±180°をまたがないように作成しているが、
+  // ドラッグで中心経度を変えると「現在の中心の対蹠側（中心+180°）」が
+  // ポリゴンの途中を通過することがある。この場合の描画破綻は
+  // drawMap() 側のサブパス分割（wraps 判定）で防いでいる。
+  // ---------------------------------------------------------------------
+  const WORLD_LAND = [
+    // ユーラシア大陸（西ヨーロッパ〜シベリア東端の手前まで）
+    [
+      [-10, 36], [-9, 43], [-1, 43], [3, 43], [7, 44], [10, 45], [13, 45],
+      [18, 42], [23, 40], [27, 41], [30, 41], [35, 42], [40, 41], [45, 40],
+      [50, 40], [55, 38], [60, 40], [65, 42], [70, 45], [75, 50], [80, 55],
+      [90, 60], [100, 62], [110, 65], [120, 68], [130, 70], [140, 72],
+      [150, 68], [160, 65], [170, 66], [178, 68], [178, 72], [160, 75],
+      [140, 76], [120, 77], [100, 78], [80, 76], [60, 70], [50, 68],
+      [40, 66], [30, 65], [20, 63], [10, 60], [3, 58], [-3, 52], [-6, 48],
+      [-10, 44],
+    ],
+    // アフリカ大陸
+    [
+      [-17, 21], [-16, 15], [-10, 6], [-5, 5], [3, 6], [8, 4], [9, -2],
+      [13, -6], [12, -18], [15, -23], [18, -28], [20, -34], [26, -33],
+      [32, -29], [35, -22], [40, -15], [43, -3], [48, 2], [50, 10],
+      [43, 12], [40, 15], [35, 20], [33, 27], [30, 31], [25, 32], [20, 32],
+      [11, 33], [3, 36], [-6, 35], [-12, 30], [-16, 27],
+    ],
+    // 北アメリカ大陸
+    [
+      [-165, 65], [-160, 70], [-150, 71], [-140, 70], [-130, 70], [-125, 68],
+      [-95, 68], [-80, 70], [-65, 66], [-60, 60], [-64, 55], [-70, 50],
+      [-65, 45], [-67, 40], [-75, 36], [-80, 32], [-81, 26], [-97, 26],
+      [-97, 20], [-105, 20], [-110, 24], [-115, 28], [-120, 34], [-124, 40],
+      [-124, 46], [-125, 49], [-130, 52], [-140, 58], [-155, 60],
+      [-165, 60],
+    ],
+    // 南アメリカ大陸
+    [
+      [-79, 8], [-77, 1], [-80, -4], [-81, -6], [-75, -14], [-71, -18],
+      [-70, -23], [-70, -30], [-71, -37], [-73, -42], [-72, -50], [-68, -54],
+      [-65, -55], [-62, -52], [-62, -45], [-58, -38], [-57, -33], [-54, -25],
+      [-48, -25], [-40, -13], [-38, -5], [-45, 0], [-50, 2], [-60, 5],
+      [-65, 8], [-72, 11], [-77, 8],
+    ],
+    // オーストラリア大陸
+    [
+      [113, -22], [114, -28], [118, -33], [124, -33], [131, -32], [136, -35],
+      [140, -38], [147, -38], [150, -37], [153, -28], [153, -20], [148, -19],
+      [145, -15], [142, -11], [136, -12], [130, -12], [126, -14], [122, -18],
+      [114, -21],
+    ],
+    // グリーンランド
+    [
+      [-45, 60], [-42, 65], [-40, 72], [-35, 78], [-25, 82], [-25, 76],
+      [-30, 70], [-38, 65], [-45, 61],
+    ],
+    // 南極大陸（簡易化。360°帯状の実データではなく、単純な閉多角形として近似）
+    [
+      [-170, -70], [-140, -75], [-100, -78], [-60, -76], [-20, -74],
+      [20, -70], [60, -66], [100, -66], [140, -68], [170, -70],
+      [170, -85], [-170, -85],
+    ],
+    // 日本列島（簡易化）
+    [
+      [130, 31], [132, 33], [136, 34], [139, 35], [141, 39], [141, 43],
+      [145, 44], [142, 45], [140, 41], [139, 37], [136, 35], [133, 34],
+      [130, 33],
+    ],
+    // イギリス諸島（簡易化）
+    [
+      [-5, 50], [-3, 51], [1, 51], [0, 53], [-3, 55], [-5, 58], [-6, 56],
+      [-6, 53], [-5, 51],
+    ],
+    // マダガスカル
+    [
+      [43, -12], [47, -13], [50, -16], [47, -25], [44, -23], [43, -18],
+    ],
+  ];
+
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+  const state = {
+    centerLonDeg: 0,
+    scale: 1,
+    isDragging: false,
+    lastPointerX: 0,
+    needsRedraw: true,
+  };
+
+  const canvas = document.getElementById("map");
+  const lonReadout = document.getElementById("lonReadout");
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    canvas.style.display = "none";
+    document.getElementById("fallback").style.display = "block";
+    console.error("Canvas 2D context is not supported by this browser.");
+    return;
+  }
+
+  // ---------------------------------------------------------------------
+  // Render module
+  // ---------------------------------------------------------------------
+  let cssWidth = 0;
+  let cssHeight = 0;
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    cssWidth = Math.max(1, window.innerWidth);
+    cssHeight = Math.max(1, window.innerHeight);
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const margin = 0.92;
+    const scaleX = (cssWidth * margin) / (2 * PROJECTED_X_MAX);
+    const scaleY = (cssHeight * margin) / (2 * PROJECTED_Y_MAX);
+    state.scale = Math.min(scaleX, scaleY);
+    state.needsRedraw = true;
+  }
+
+  function drawMap() {
+    const cx = cssWidth / 2;
+    const cy = cssHeight / 2;
+
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    // 海（背景）
+    ctx.fillStyle = "#0b1a2b";
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    // 陸地
+    ctx.fillStyle = "#3f8f5f";
+    ctx.strokeStyle = "#1f4a32";
+    ctx.lineWidth = 1;
+
+    for (const polygon of WORLD_LAND) {
+      ctx.beginPath();
+      let prevRelLon = null;
+      for (const [lon, lat] of polygon) {
+        const relLon = normalizeLongitude(lon - state.centerLonDeg);
+        const p = project(lon, lat, state.centerLonDeg, state.scale, cx, cy);
+        if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+          console.warn("Skipping non-finite projected point", lon, lat);
+          continue;
+        }
+        // 現在の中心経度の対蹠側（相対経度 ±180°）をまたぐ頂点間は
+        // 直線でつながず新しいサブパスとして分割し、帯状の描画破綻を防ぐ。
+        const wraps = prevRelLon !== null && Math.abs(relLon - prevRelLon) > 180;
+        if (prevRelLon === null || wraps) {
+          ctx.moveTo(p.x, p.y);
+        } else {
+          ctx.lineTo(p.x, p.y);
+        }
+        prevRelLon = relLon;
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+
+    lonReadout.textContent = state.centerLonDeg.toFixed(1);
+  }
+
+  // ---------------------------------------------------------------------
+  // Interaction module: ハンドラは状態更新のみ行い、描画は rAF ループに任せる
+  // ---------------------------------------------------------------------
+  canvas.addEventListener("pointerdown", (e) => {
+    state.isDragging = true;
+    state.lastPointerX = e.clientX;
+    canvas.classList.add("dragging");
+    canvas.setPointerCapture(e.pointerId);
+  });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!state.isDragging) return;
+    const deltaPixels = e.clientX - state.lastPointerX;
+    state.lastPointerX = e.clientX;
+    const deltaLonDeg = dragDeltaToLongitudeDelta(deltaPixels, state.scale);
+    state.centerLonDeg = normalizeLongitude(state.centerLonDeg + deltaLonDeg);
+    state.needsRedraw = true;
+  });
+
+  function endDrag(e) {
+    state.isDragging = false;
+    canvas.classList.remove("dragging");
+    if (e && e.pointerId !== undefined && canvas.hasPointerCapture(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId);
+    }
+  }
+
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+
+  window.addEventListener("resize", resizeCanvas);
+
+  // ---------------------------------------------------------------------
+  // Main loop: 必要なときだけ再描画し、requestAnimationFrame でスムーズに回す
+  // ---------------------------------------------------------------------
+  function tick() {
+    if (state.needsRedraw) {
+      drawMap();
+      state.needsRedraw = false;
+    }
+    requestAnimationFrame(tick);
+  }
+
+  resizeCanvas();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
