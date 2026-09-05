@@ -6,6 +6,10 @@ import {
   equalEarthRaw,
   project,
   dragDeltaToLongitudeDelta,
+  unwrapRingLongitudes,
+  ringLongitudeRange,
+  longitudeShiftsForView,
+  clipRingToLongitudeWindow,
   M,
   A1,
 } from "../src/equalEarth.js";
@@ -102,6 +106,170 @@ describe("project", () => {
     const south = project(0, -30, 0, scale, cx, cy);
     expect(north.y).toBeLessThan(cy);
     expect(south.y).toBeGreaterThan(cy);
+  });
+});
+
+describe("unwrapRingLongitudes", () => {
+  it("対蹠経線をまたがないリングはそのまま返す", () => {
+    const ring = [
+      [10, 5],
+      [20, 5],
+      [20, -5],
+      [10, -5],
+    ];
+    expect(unwrapRingLongitudes(ring)).toEqual(ring);
+  });
+
+  it("隣接頂点が対蹠経線をまたぐ場合、連続な値に補正する", () => {
+    // 実際には10°しか離れていないが、単純な正規化では170→-170と大きく跳ぶ。
+    const ring = [
+      [170, 0],
+      [-170, 0],
+    ];
+    const unwrapped = unwrapRingLongitudes(ring);
+    expect(unwrapped[0]).toEqual([170, 0]);
+    expect(unwrapped[1][0]).toBeCloseTo(190, 10); // -170 ではなく 190 相当に補正される
+  });
+
+  it("結果の隣接差は常に小さい（180°を超えるジャンプが生じない）", () => {
+    const ring = [
+      [175, 10],
+      [-175, 12],
+      [-178, 8],
+      [179, 5],
+      [170, 3],
+    ];
+    const unwrapped = unwrapRingLongitudes(ring);
+    for (let i = 1; i < unwrapped.length; i++) {
+      expect(Math.abs(unwrapped[i][0] - unwrapped[i - 1][0])).toBeLessThanOrEqual(10 + 1e-9);
+    }
+  });
+
+  it("緯度は変更しない", () => {
+    const ring = [
+      [170, 12.5],
+      [-170, -33.3],
+    ];
+    const unwrapped = unwrapRingLongitudes(ring);
+    expect(unwrapped[0][1]).toBe(12.5);
+    expect(unwrapped[1][1]).toBe(-33.3);
+  });
+});
+
+describe("ringLongitudeRange", () => {
+  it("連続経度化されたリングの最小・最大経度を返す", () => {
+    const unwrapped = [
+      [170, 0],
+      [190, 0],
+      [175, 10],
+    ];
+    expect(ringLongitudeRange(unwrapped)).toEqual([170, 190]);
+  });
+});
+
+describe("longitudeShiftsForView", () => {
+  it("中心経度の近くにあるリングはオフセット0で表示できる", () => {
+    const shifts = longitudeShiftsForView([10, 20], 0);
+    expect(shifts).toContain(0);
+  });
+
+  it("中心の対蹠側にあるリングは、表示に必要なオフセットを1つ返す", () => {
+    // 中心経度0のとき、経度190°付近のリングは -360 のオフセットで
+    // -170°付近として表示範囲(-180,180]に入る。
+    const shifts = longitudeShiftsForView([185, 195], 0);
+    expect(shifts).toHaveLength(1);
+    expect(shifts[0]).toBe(-360);
+  });
+
+  it("表示範囲の両端にかかるリングには複数のオフセットを返す", () => {
+    // 中心経度180のとき、経度0°付近のリング（幅20°）は
+    // 表示範囲の右端(+180)にも左端(-180相当=+180から見て360引いた側)にも
+    // またがり得るため、+180 と -180 の双方のオフセットが該当し得る。
+    const shifts = longitudeShiftsForView([-10, 10], 180);
+    expect(shifts.length).toBeGreaterThanOrEqual(1);
+    // 実際に表示範囲内に入るオフセットのみが返っていることを検証する。
+    for (const shift of shifts) {
+      expect(10 + shift).toBeGreaterThanOrEqual(180 - 180 - 1e-9);
+      expect(-10 + shift).toBeLessThanOrEqual(180 + 180 + 1e-9);
+    }
+  });
+
+  it("Antarcticaのような360°に及ぶ広いリングでも、表示に必要なオフセットを漏れなく返す", () => {
+    const shifts = longitudeShiftsForView([-180, 180], 77);
+    expect(shifts.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("clipRingToLongitudeWindow", () => {
+  it("すべての頂点が範囲内のリングはそのまま返す", () => {
+    const points = [
+      [10, 5],
+      [20, 5],
+      [20, -5],
+      [10, -5],
+    ];
+    expect(clipRingToLongitudeWindow(points)).toEqual(points);
+  });
+
+  it("すべての頂点が範囲外のリングは空になる", () => {
+    const points = [
+      [200, 5],
+      [210, 5],
+      [210, -5],
+      [200, -5],
+    ];
+    expect(clipRingToLongitudeWindow(points)).toEqual([]);
+  });
+
+  it("境界を1回はみ出すリングは、境界上の点を挿入して切り詰められる", () => {
+    const points = [
+      [170, 10],
+      [190, 10],
+      [190, -10],
+      [170, -10],
+    ];
+    const clipped = clipRingToLongitudeWindow(points);
+    for (const [lon] of clipped) {
+      expect(lon).toBeGreaterThanOrEqual(-180 - 1e-9);
+      expect(lon).toBeLessThanOrEqual(180 + 1e-9);
+    }
+    // 元の190°だった頂点は180°に切り詰められているはず。
+    expect(clipped.some(([lon]) => Math.abs(lon - 180) < 1e-9)).toBe(true);
+  });
+
+  it("境界上の閉じ辺で緯度差が大きい場合は細かく細分化される", () => {
+    const points = [
+      [170, 60],
+      [190, 60],
+      [190, -60],
+      [170, -60],
+    ];
+    const clipped = clipRingToLongitudeWindow(points);
+    // 境界(180°)上の隣接点はどこも緯度差が小さい。
+    for (let i = 0; i < clipped.length; i++) {
+      const curr = clipped[i];
+      const next = clipped[(i + 1) % clipped.length];
+      if (curr[0] === next[0] && Math.abs(curr[0]) === 180) {
+        expect(Math.abs(next[1] - curr[1])).toBeLessThanOrEqual(2 + 1e-9);
+      }
+    }
+  });
+
+  it("回帰テスト: 高緯度・relLonが180°を大きく超える点は必ず除去される", () => {
+    // 実データで確認された不具合の再現ケース: 緯度78°付近・relLon 300°超の点は、
+    // 投影後のx座標がキャンバスの余白内に収まってしまうことがあるため、
+    // 投影前に明示的なクリップで除去されていなければならない。
+    const points = [
+      [104, 77.7],
+      [105, 77.6],
+      [106, 77.5],
+      [105, 77.4],
+    ].map(([lon, lat]) => [lon + 360 - 162.7, lat]); // シフト+中心経度差し引き後の relLon
+    const clipped = clipRingToLongitudeWindow(points);
+    for (const [lon] of clipped) {
+      expect(lon).toBeGreaterThanOrEqual(-180 - 1e-9);
+      expect(lon).toBeLessThanOrEqual(180 + 1e-9);
+    }
   });
 });
 
